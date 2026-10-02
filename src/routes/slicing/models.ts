@@ -33,6 +33,13 @@ export interface SlicingSettings {
   processName?: string;
   filamentName?: string;
   filamentNames?: string;
+  // Dual-nozzle printers (H2D, X2D): which extruder each filament prints
+  // from, one 1-based extruder id per filament in plate order, comma- or
+  // semicolon-separated, e.g. "1,2". The CLI honours `filament_map` only
+  // from its own `--filament-map` flag; the same value inside the process
+  // config or the 3MF is echoed into the output and ignored. When this is
+  // absent the CLI arguments are exactly what they were without it.
+  filamentMap?: string;
 }
 
 export interface SliceResult {
