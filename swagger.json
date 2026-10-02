@@ -90,6 +90,11 @@
                   "multicolorOnePlate": {
                     "type": "boolean",
                     "description": "Allow multicolor on one plate when using arrange (optional, default: false)"
+                  },
+                  "filamentMap": {
+                    "type": "string",
+                    "example": "1,2",
+                    "description": "Dual-nozzle printers only: the 1-based extruder each filament prints from, one id per filament in plate order, comma- or semicolon-separated. Passed to the CLI as --filament-map with --filament-map-mode Manual. Omit it to keep the slicer's default grouping (optional)"
                   }
                 }
               }
@@ -230,6 +235,11 @@
                   "multicolorOnePlate": {
                     "type": "boolean",
                     "description": "Allow multicolor on one plate when using arrange (optional, default: false)"
+                  },
+                  "filamentMap": {
+                    "type": "string",
+                    "example": "1,2",
+                    "description": "Dual-nozzle printers only: the 1-based extruder each filament prints from, one id per filament in plate order, comma- or semicolon-separated. Passed to the CLI as --filament-map with --filament-map-mode Manual. Omit it to keep the slicer's default grouping (optional)"
                   }
                 }
               }

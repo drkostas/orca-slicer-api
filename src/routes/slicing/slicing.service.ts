@@ -76,6 +76,10 @@ export async function sliceModel(
     );
   }
 
+  // Also checked before the workdir exists, so a malformed map is a plain
+  // 400 rather than a half-prepared slice to clean up.
+  const filamentMap = parseFilamentMap(settings);
+
   let workdir: string;
   let inPath: string;
   let inputDir: string;
@@ -195,45 +199,15 @@ export async function sliceModel(
     throw error;
   }
 
-  const args: string[] = [];
-
-  if (settings.exportType === "3mf") {
-    args.push("--export-3mf", "result.3mf");
-  }
-
-  const sliceArg = settings.plate === undefined ? "1" : settings.plate;
-  args.push("--slice", sliceArg);
-
-  if (settings.arrange !== undefined) {
-    args.push("--arrange", settings.arrange ? "1" : "0");
-  }
-
-  if (settings.orient !== undefined) {
-    args.push("--orient", settings.orient ? "1" : "0");
-  }
-
-  if (printerPath && presetPath) {
-    args.push("--load-settings", `${printerPath};${presetPath}`);
-  }
-
-  if (filamentPaths.length > 0) {
-    // OrcaSlicer / BambuStudio CLI expects ALL filament profiles in a single
-    // --load-filaments arg, semicolon-separated, in plate slot order.
-    args.push("--load-filaments", filamentPaths.join(";"));
-  }
-
-  if (settings.bedType) {
-    args.push("--curr-bed-type", settings.bedType);
-  }
-
-  if (settings.multicolorOnePlate) {
-    args.push("--allow-multicolor-oneplate");
-  }
-
-  args.push("--allow-newer-file");
-  args.push("--outputdir", outputDir);
-
-  args.push(inPath);
+  const args = buildSliceArgs({
+    settings,
+    filamentMap,
+    printerPath,
+    presetPath,
+    filamentPaths,
+    outputDir,
+    inPath,
+  });
 
   // Capture stdout + stderr so failure diagnostics survive the spawn-error
   // wrapper. The CLI prints the *reason* it rejected an input (range checks,
@@ -487,6 +461,111 @@ function formatCliFailure(
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}… [truncated ${s.length - max} chars]` : s;
+}
+
+/**
+ * The OrcaSlicer / BambuStudio CLI arguments for one slice, minus the
+ * optional `--pipe` progress FIFO, which needs the workdir to exist.
+ *
+ * Pure, so the argument list can be checked without spawning a slicer.
+ */
+export function buildSliceArgs(opts: {
+  settings: SlicingSettings;
+  filamentMap?: string[];
+  printerPath?: string;
+  presetPath?: string;
+  filamentPaths: string[];
+  outputDir: string;
+  inPath: string;
+}): string[] {
+  const {
+    settings,
+    filamentMap,
+    printerPath,
+    presetPath,
+    filamentPaths,
+    outputDir,
+    inPath,
+  } = opts;
+  const args: string[] = [];
+
+  if (settings.exportType === "3mf") {
+    args.push("--export-3mf", "result.3mf");
+  }
+
+  const sliceArg = settings.plate === undefined ? "1" : settings.plate;
+  args.push("--slice", sliceArg);
+
+  if (settings.arrange !== undefined) {
+    args.push("--arrange", settings.arrange ? "1" : "0");
+  }
+
+  if (settings.orient !== undefined) {
+    args.push("--orient", settings.orient ? "1" : "0");
+  }
+
+  if (printerPath && presetPath) {
+    args.push("--load-settings", `${printerPath};${presetPath}`);
+  }
+
+  if (filamentPaths.length > 0) {
+    // OrcaSlicer / BambuStudio CLI expects ALL filament profiles in a single
+    // --load-filaments arg, semicolon-separated, in plate slot order.
+    args.push("--load-filaments", filamentPaths.join(";"));
+  }
+
+  if (filamentMap && filamentMap.length > 0) {
+    // Dual-nozzle printers: the CLI reads `filament_map` only from this flag
+    // (a value in the process config or the 3MF is ignored), and only in
+    // Manual mode -- the auto modes regroup the filaments themselves.
+    args.push("--filament-map", filamentMap.join(","));
+    args.push("--filament-map-mode", "Manual");
+  }
+
+  if (settings.bedType) {
+    args.push("--curr-bed-type", settings.bedType);
+  }
+
+  if (settings.multicolorOnePlate) {
+    args.push("--allow-multicolor-oneplate");
+  }
+
+  args.push("--allow-newer-file");
+  args.push("--outputdir", outputDir);
+
+  args.push(inPath);
+
+  return args;
+}
+
+/**
+ * Parse `settings.filamentMap` into one extruder id per filament.
+ *
+ * Returns undefined when no map was given, which leaves the CLI arguments
+ * untouched. A map that is present but malformed is the caller's error and
+ * answered with a 400, rather than guessed at: a wrong map prints the wrong
+ * colours, which is worse than a refused slice.
+ */
+export function parseFilamentMap(
+  settings: SlicingSettings,
+): string[] | undefined {
+  const raw = settings.filamentMap;
+  if (raw === undefined || raw === null) return undefined;
+  const entries = String(raw)
+    .split(/[,;]/)
+    .map((e) => e.trim())
+    .filter((e) => e.length > 0);
+  if (entries.length === 0) return undefined;
+  for (const e of entries) {
+    if (!/^[1-9][0-9]*$/.test(e)) {
+      throw new AppError(
+        400,
+        `Invalid filamentMap "${String(raw)}"`,
+        "filamentMap must list one 1-based extruder id per filament, e.g. \"1,2\"",
+      );
+    }
+  }
+  return entries;
 }
 
 export function parseDiskFilamentNames(settings: SlicingSettings): string[] {
