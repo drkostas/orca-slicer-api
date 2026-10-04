@@ -1,6 +1,11 @@
 import { promises as fs } from "fs";
 import * as path from "path";
 import { AppError } from "../../middleware/error";
+import {
+  loadProfileIndex,
+  lookupProfile,
+  type ProfileScope,
+} from "./profile-index";
 
 export type ProfileCategory = "machine" | "process" | "filament";
 
@@ -75,6 +80,11 @@ export async function resolveProfile(
   const templates = await readTemplateIndex(
     path.join(options.bundledProfilesPath, category),
   );
+  // Parents are found by name through the vendor manifest, not by guessing
+  // `<category>/<name>.json`: a third of the BBL filament presets sit in
+  // subfolders, and OrcaSlicer's filament library sits beside the vendor.
+  const index = await loadProfileIndex(options.bundledProfilesPath);
+  let scope: ProfileScope = "vendor";
 
   while (
     typeof current.inherits === "string" &&
@@ -89,11 +99,12 @@ export async function resolveProfile(
     }
 
     const parentName = current.inherits;
-    const parentPath = path.join(
-      options.bundledProfilesPath,
-      category,
-      `${parentName}.json`,
-    );
+    const found = lookupProfile(index, category, parentName, scope);
+    if (!found) {
+      delete current.inherits;
+      break;
+    }
+    const parentPath = found.file;
 
     let parentRaw: string;
     try {
@@ -120,9 +131,14 @@ export async function resolveProfile(
     // provide. That ordering is what makes the generic
     // `fdm_machine_common` value lose to the model's real block, and what
     // lets a 0.6 nozzle preset inherit its 0.4 sibling's companion.
-    await applyCompanionTemplates(parent, parentName, category, options, templates);
+    // Companions only exist in the vendor folder; a library preset that
+    // happened to share a vendor preset's name must not pick one up.
+    if (found.scope === "vendor") {
+      await applyCompanionTemplates(parent, parentName, category, options, templates);
+    }
 
     current = mergeProfiles(parent, current);
+    scope = found.scope;
     depth += 1;
   }
 

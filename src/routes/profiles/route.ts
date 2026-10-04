@@ -17,6 +17,10 @@ import {
 } from "./bundle.service";
 import { AppError } from "../../middleware/error";
 import {
+  loadProfileIndex,
+  type ProfileScope,
+} from "../slicing/profile-index";
+import {
   getDefaultBundledProfilesPath,
   resolveProfile,
   type ProfileCategory,
@@ -26,7 +30,8 @@ import {
 const router = Router();
 
 // In-process cache for the bundled-profiles index. The bundle is read from the
-// slicer's read-only `resources/profiles/BBL/` tree, which only changes when
+// slicer's read-only `resources/profiles/` trees (the vendor, plus OrcaSlicer's
+// filament library beside it), which only change when
 // the container image is rebuilt — a long TTL is safe and avoids re-reading
 // hundreds of JSON files on every Slice modal open. `null` = "not yet built".
 export type BundledEntry = {
@@ -64,6 +69,14 @@ export type BundledFilament = BundledCompatEntry & {
   // stays in the response for third-party bundles that do set it.
   filament_type: string | null;
   filament_colour: string | null;
+  // Whether the slicer treats this as a support material (`Bambu Support W`,
+  // `Bambu Support For PA/PET`, PVA, ...). They state the material they
+  // support -- PLA, PA, ABS -- so on material alone a support preset ties
+  // with the real one, and Bambuddy needs this to prefer the real one.
+  // null when no preset in the chain says.
+  filament_is_support: boolean | null;
+  // `filament_vendor`, e.g. "Bambu Lab", "Generic", "Polymaker".
+  filament_vendor: string | null;
 };
 type BundledIndex = {
   printer: BundledEntry[];
@@ -91,52 +104,136 @@ router.get("/bundled", async (_req, res) => {
     return;
   }
 
-  const result: BundledIndex = {
-    printer: await readBundledDir(path.join(bundledPath, "machine"), "printer"),
-    process: (await readBundledDir(
-      path.join(bundledPath, "process"),
-      "process",
-    )) as BundledCompatEntry[],
-    filament: (await readBundledDir(
-      path.join(bundledPath, "filament"),
-      "filament",
-    )) as BundledFilament[],
-  };
+  const result = await buildBundledIndex(bundledPath);
   bundledIndexCache = result;
   bundledIndexCachedAt = now;
   res.status(200).json(result);
 });
 
 /**
- * Index one category directory of a bundled-profile tree.
+ * The Standard-tier listing for the vendor tree at ``bundledPath``.
  *
- * Exported for unit tests: the inherited-field resolution below is the only
- * reason a P1S sees any process preset at all, and it is worth pinning against
- * a fixture tree rather than only against whichever slicer build the image
- * happens to carry.
+ * Presets are found through the vendor manifest (subfolders included), and
+ * on an OrcaSlicer image the filament library beside the vendor is listed
+ * too. See slicing/profile-index.ts for why both matter.
+ */
+export async function buildBundledIndex(
+  bundledPath: string,
+): Promise<BundledIndex> {
+  const index = await loadProfileIndex(bundledPath);
+  const machines = await readProfiles(index.vendor.files.machine);
+  const processes = await readProfiles(index.vendor.files.process);
+  const filaments = await readProfiles(index.vendor.files.filament);
+  const library = index.library
+    ? await readProfiles(index.library.files.filament)
+    : new Map<string, BundledProfile>();
+
+  const printer = listProfiles(machines, "printer", vendorOnly(machines));
+  const process = listProfiles(processes, "process", vendorOnly(processes)) as BundledCompatEntry[];
+  const filamentParents = withLibrary(filaments, library);
+
+  // Order matters beyond looks. Bambuddy shows this list as it comes, and its
+  // filament auto-pick gives every preset of the right material the same
+  // score, so the first one wins the tie. Plain alphabetical order made
+  // `addnorth PLA E-PLA` the pick for every PLA plate, and
+  // `Bambu Support For PA/PET` (which states PA) the pick for every PA plate.
+  //
+  // So, within the vendor tree and within the library: real filaments before
+  // support materials, then Bambu's own, then Generic, then other brands,
+  // alphabetical last. Folder position is no guide here -- Bambu Studio keeps
+  // `Bambu ABS @BBL P1P` in `filament/P1P/` but `PolyLite ABS @BBL P1P` at
+  // the top. The library comes after the whole vendor tree, which keeps
+  // Bambu's support-flagged `Generic HIPS` (HIPS is mostly used as support)
+  // ahead of a library HIPS.
+  const vendorFilaments = listProfiles(filaments, "filament", filamentParents) as BundledFilament[];
+  vendorFilaments.sort(preferredFirst);
+  const libraryFilaments = listLibraryFilaments(library, filaments, printerPresets(machines), filamentParents);
+  libraryFilaments.sort(preferredFirst);
+  return { printer, process, filament: [...vendorFilaments, ...libraryFilaments] };
+}
+
+const VENDOR_RANK: Record<string, number> = { "Bambu Lab": 0, Generic: 1 };
+
+function preferredFirst(a: BundledFilament, b: BundledFilament): number {
+  const support = (f: BundledFilament) => (f.filament_is_support === true ? 1 : 0);
+  const vendor = (f: BundledFilament) => VENDOR_RANK[f.filament_vendor ?? ""] ?? 2;
+  return (
+    support(a) - support(b) ||
+    vendor(a) - vendor(b) ||
+    a.name.localeCompare(b.name)
+  );
+}
+
+/**
+ * Index one flat category directory of a bundled-profile tree.
+ *
+ * Kept for a tree without a vendor manifest and for unit tests: the
+ * inherited-field resolution below is the only reason a P1S sees any process
+ * preset at all, and it is worth pinning against a fixture tree rather than
+ * only against whichever slicer build the image happens to carry.
  */
 export async function readBundledDir(
   dir: string,
   kind: "printer" | "process" | "filament",
 ): Promise<BundledEntry[]> {
-  if (!fs.existsSync(dir)) return [];
   let entries: string[];
   try {
     entries = await fs.promises.readdir(dir);
   } catch {
     return [];
   }
-
-  // Read the whole directory up front, abstract bases included. The bases are
-  // never offered to the user, but they are where the inherited fields
-  // actually live, so the walk below needs them in hand.
-  const byName = new Map<string, BundledProfile>();
+  const files = new Map<string, string>();
   for (const entry of entries) {
-    if (!entry.endsWith(".json")) continue;
+    if (entry.endsWith(".json")) files.set(entry, path.join(dir, entry));
+  }
+  const byName = await readProfiles(files);
+  return listProfiles(byName, kind, vendorOnly(byName));
+}
+
+// How a walk finds a profile's parent: by name, from the scope the child was
+// found in. Vendor presets fall back to the filament library; library presets
+// never leave it (104 names exist in both trees, with different contents).
+type ParentOf = (
+  name: string,
+  scope: ProfileScope,
+) => { profile: BundledProfile; scope: ProfileScope } | undefined;
+
+function vendorOnly(byName: Map<string, BundledProfile>): ParentOf {
+  return (name, scope) => {
+    const profile = scope === "vendor" ? byName.get(name) : undefined;
+    return profile ? { profile, scope } : undefined;
+  };
+}
+
+function withLibrary(
+  vendor: Map<string, BundledProfile>,
+  library: Map<string, BundledProfile>,
+): ParentOf {
+  return (name, scope) => {
+    if (scope === "vendor") {
+      const own = vendor.get(name);
+      if (own) return { profile: own, scope: "vendor" };
+    }
+    const shared = library.get(name);
+    return shared ? { profile: shared, scope: "library" } : undefined;
+  };
+}
+
+/**
+ * Read every file of one category, keyed by the preset name it declares.
+ *
+ * Abstract bases are read too: they are never offered to the user, but they
+ * are where the inherited fields actually live, so the walk needs them.
+ */
+async function readProfiles(
+  files: Map<string, string>,
+): Promise<Map<string, BundledProfile>> {
+  const byName = new Map<string, BundledProfile>();
+  for (const file of files.values()) {
     try {
-      const raw = await fs.promises.readFile(path.join(dir, entry), "utf8");
+      const raw = await fs.promises.readFile(file, "utf8");
       const json = JSON.parse(raw) as BundledProfile;
-      if (typeof json.name === "string" && json.name.length > 0) {
+      if (typeof json.name === "string" && json.name.length > 0 && !byName.has(json.name)) {
         byName.set(json.name, json);
       }
     } catch {
@@ -145,7 +242,15 @@ export async function readBundledDir(
       continue;
     }
   }
+  return byName;
+}
 
+function listProfiles(
+  byName: Map<string, BundledProfile>,
+  kind: "printer" | "process" | "filament",
+  parentOf: ParentOf,
+  scope: ProfileScope = "vendor",
+): BundledEntry[] {
   const out: BundledEntry[] = [];
   for (const json of byName.values()) {
     // Bundled profiles ship a mix of concrete presets and abstract bases
@@ -159,11 +264,10 @@ export async function readBundledDir(
       out.push(base);
       continue;
     }
+    const field = (key: string) => inheritedFieldIn(parentOf, json, scope, key);
     const compat: BundledCompatEntry = {
       ...base,
-      compatible_printers: stringList(
-        inheritedField(byName, json, "compatible_printers"),
-      ),
+      compatible_printers: stringList(field("compatible_printers")),
     };
     if (kind === "process") {
       out.push(compat);
@@ -171,24 +275,88 @@ export async function readBundledDir(
     }
     const filament: BundledFilament = {
       ...compat,
-      filament_type: firstScalar(
-        inheritedField(byName, json, "filament_type") as
-          | string
-          | string[]
-          | undefined,
-      ),
-      filament_colour: firstScalar(
-        inheritedField(byName, json, "filament_colour") as
-          | string
-          | string[]
-          | undefined,
-      ),
+      filament_type: firstScalar(field("filament_type") as string | string[] | undefined),
+      filament_colour: firstScalar(field("filament_colour") as string | string[] | undefined),
+      filament_is_support: flag(firstScalar(field("filament_is_support") as string | string[] | undefined)),
+      filament_vendor: firstScalar(field("filament_vendor") as string | string[] | undefined),
     };
     out.push(filament);
   }
   // Stable alphabetical order by name so the dropdown is predictable.
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
+}
+
+/**
+ * The filament library's presets, each with the printers it is offered on.
+ *
+ * A library preset declares no printers, which the slicer reads as "every
+ * printer" -- minus the printers where a printer-specific preset of the same
+ * material supersedes it (PresetCollection::update_library_profile_excluded_from).
+ * "Same material" is the alias: the preset's `alias` field, else its name up
+ * to the first `@`. So `Elegoo PLA @System` is offered on every Bambu printer
+ * except those an `Elegoo PLA @BBL ...` preset names.
+ *
+ * The list is spelled out rather than left null: null tells the consumer to
+ * guess the printer from the preset NAME, and `@System` names none.
+ */
+function listLibraryFilaments(
+  library: Map<string, BundledProfile>,
+  vendor: Map<string, BundledProfile>,
+  printers: string[],
+  parentOf: ParentOf,
+): BundledFilament[] {
+  if (library.size === 0) return [];
+
+  const superseded = new Map<string, Set<string>>();
+  const supersede = (json: BundledProfile, scope: ProfileScope) => {
+    const names = stringList(inheritedFieldIn(parentOf, json, scope, "compatible_printers"));
+    if (!names) return;
+    const alias = presetAlias(json);
+    const set = superseded.get(alias) ?? new Set<string>();
+    for (const name of names) set.add(name);
+    superseded.set(alias, set);
+  };
+  for (const json of vendor.values()) supersede(json, "vendor");
+  for (const json of library.values()) supersede(json, "library");
+
+  const allPrinters = printers;
+  const out: BundledFilament[] = [];
+  for (const entry of listProfiles(library, "filament", parentOf, "library") as BundledFilament[]) {
+    if (entry.compatible_printers === null) {
+      const json = library.get(entry.name)!;
+      const excluded = superseded.get(presetAlias(json)) ?? new Set<string>();
+      const offered = allPrinters.filter((name) => !excluded.has(name));
+      // Superseded everywhere: the slicer would never offer it on this vendor.
+      if (offered.length === 0) continue;
+      entry.compatible_printers = offered;
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
+ * The vendor's real printer presets. The machine folder also holds model
+ * descriptions (`"type": "machine_model"`, named "Bambu Lab A1" with no
+ * nozzle), which the printer listing has always carried along but which no
+ * filament can be sliced against, so they must not land in a library
+ * filament's printer list.
+ */
+function printerPresets(machines: Map<string, BundledProfile>): string[] {
+  return [...machines.values()]
+    .filter((json) => json.instantiation === "true" && json.type !== "machine_model")
+    .map((json) => json.name as string)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+function presetAlias(json: BundledProfile): string {
+  if (typeof json.alias === "string" && json.alias.length > 0) return json.alias;
+  const name = json.name ?? "";
+  const at = name.indexOf("@");
+  if (at < 0) return name;
+  const alias = name.slice(0, at).trimEnd();
+  return alias.length > 0 ? alias : name;
 }
 
 export type BundledProfile = Record<string, unknown> & {
@@ -198,9 +366,10 @@ export type BundledProfile = Record<string, unknown> & {
 };
 
 // A profile that inherits from a missing parent ends the walk with whatever it
-// has. 32 of the shipped BBL filament profiles do exactly that -- their
-// `inherits` names a file the bundle does not contain -- so this has to be a
-// silent stop, the same way the slicing resolver treats a dangling `inherits`.
+// has. A tree read without its vendor manifest or without the filament library
+// beside it has such profiles (147 BBL filament presets have their `@base` in
+// the library), so this has to be a silent stop, the same way the slicing
+// resolver treats a dangling `inherits`.
 const MAX_INHERITS_DEPTH = 12;
 
 /**
@@ -218,16 +387,29 @@ export function inheritedField(
   profile: BundledProfile,
   key: string,
 ): unknown {
+  return inheritedFieldIn(vendorOnly(byName), profile, "vendor", key);
+}
+
+function inheritedFieldIn(
+  parentOf: ParentOf,
+  profile: BundledProfile,
+  scope: ProfileScope,
+  key: string,
+): unknown {
   let current: BundledProfile | undefined = profile;
+  let currentScope = scope;
   const seen = new Set<string>();
   for (let depth = 0; current && depth <= MAX_INHERITS_DEPTH; depth += 1) {
     if (key in current) return current[key];
     const parent = current.inherits;
-    if (typeof parent !== "string" || parent.length === 0 || seen.has(parent)) {
+    const seenKey = `${currentScope}:${parent}`;
+    if (typeof parent !== "string" || parent.length === 0 || seen.has(seenKey)) {
       return undefined;
     }
-    seen.add(parent);
-    current = byName.get(parent);
+    seen.add(seenKey);
+    const found = parentOf(parent, currentScope);
+    current = found?.profile;
+    if (found) currentScope = found.scope;
   }
   return undefined;
 }
@@ -245,6 +427,12 @@ function stringList(value: unknown): string[] | null {
     .map((name) => name.trim())
     .filter((name) => name.length > 0);
   return names.length > 0 ? names : null;
+}
+
+function flag(value: string | null): boolean | null {
+  if (value === "1") return true;
+  if (value === "0") return false;
+  return null;
 }
 
 function firstScalar(value: string | string[] | undefined): string | null {
