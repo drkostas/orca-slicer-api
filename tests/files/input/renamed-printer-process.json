@@ -1,0 +1,8 @@
+{
+  "type": "process",
+  "name": "0.20mm Standard - Skew",
+  "inherits": "0.20mm Standard @BBL X1C",
+  "from": "User",
+  "curr_bed_type": "Textured PEI Plate",
+  "compatible_printers": ["Bambu Lab X1 Carbon 0.4 nozzle - Skew Calibration"]
+}

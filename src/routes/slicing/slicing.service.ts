@@ -13,8 +13,11 @@ import { Open } from "unzipper";
 import {
   ensureProfileType,
   getDefaultBundledProfilesPath,
+  acceptPrinterParent,
   normalizeFromField,
+  printerIdentity,
   resolveProfile,
+  type PrinterIdentity,
   type ProfileCategory,
   type ProfileJson,
 } from "./profile-resolver";
@@ -125,7 +128,7 @@ export async function sliceModel(
       if (p) bundleFilamentPaths.push(p);
     }
 
-    printerPath = await materializeProfile({
+    const printer = await materializeProfile({
       inputDir,
       filename: "printer.json",
       category: "machine",
@@ -136,7 +139,9 @@ export async function sliceModel(
       diskCategoryDir: "printers",
       bundledProfilesPath,
     });
-    presetPath = await materializeProfile({
+    printerPath = printer?.path;
+    const printerId = printer ? printerIdentity(printer.profile) : null;
+    presetPath = (await materializeProfile({
       inputDir,
       filename: "preset.json",
       category: "process",
@@ -146,7 +151,8 @@ export async function sliceModel(
       diskBase: basePath,
       diskCategoryDir: "presets",
       bundledProfilesPath,
-    });
+      printer: printerId,
+    }))?.path;
 
     // Resolve filaments in plate order: each upload buffer (or each
     // comma-separated diskName, or each bundle filament path) becomes a
@@ -180,8 +186,9 @@ export async function sliceModel(
         diskBase: basePath,
         diskCategoryDir: "filaments",
         bundledProfilesPath,
+        printer: printerId,
       });
-      if (p) filamentPaths.push(p);
+      if (p) filamentPaths.push(p.path);
     }
   } catch (error) {
     await fs.rm(workdir, { recursive: true, force: true });
@@ -613,11 +620,14 @@ interface MaterializeProfileArgs {
   diskBase: string;
   diskCategoryDir: string;
   bundledProfilesPath: string | undefined;
+  // The printer preset already materialised for this slice, for the
+  // process and filament ones (see acceptPrinterParent).
+  printer?: PrinterIdentity | null;
 }
 
 async function materializeProfile(
   args: MaterializeProfileArgs,
-): Promise<string | undefined> {
+): Promise<{ path: string; profile: ProfileJson } | undefined> {
   let raw: string;
   let isUserUpload: boolean;
 
@@ -678,11 +688,16 @@ async function materializeProfile(
     }
     profile = await resolveProfile(profile, args.category, {
       bundledProfilesPath: args.bundledProfilesPath,
+      // Only a printer preset's name is checked by the CLI (bambuddy#3250).
+      keepSystemParent: args.category === "machine",
     });
   }
 
   ensureProfileType(profile, args.category);
   normalizeFromField(profile);
+  if (args.category !== "machine") {
+    acceptPrinterParent(profile, args.printer ?? null);
+  }
 
   const outPath = path.join(args.inputDir, args.filename);
   try {
@@ -694,5 +709,5 @@ async function materializeProfile(
       err instanceof Error ? err.message : String(err),
     );
   }
-  return outPath;
+  return { path: outPath, profile };
 }

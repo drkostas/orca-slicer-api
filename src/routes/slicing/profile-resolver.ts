@@ -18,6 +18,9 @@ export type ProfileJson = Record<string, unknown> & {
 export interface ResolveOptions {
   bundledProfilesPath: string;
   maxDepth?: number;
+  // Keep a renamed preset pointing at the bundled preset it was saved from.
+  // See keepSystemParent below; only the slicing path asks for it.
+  keepSystemParent?: boolean;
 }
 
 const DEFAULT_MAX_DEPTH = 16;
@@ -85,6 +88,15 @@ export async function resolveProfile(
   // subfolders, and OrcaSlicer's filament library sits beside the vendor.
   const index = await loadProfileIndex(options.bundledProfilesPath);
   let scope: ProfileScope = "vendor";
+  // The nearest ancestor a user can actually select, i.e. the bundled preset
+  // this one was saved from. Templates (`instantiation: "false"`, such as
+  // fdm_bbl_3dp_001_common) are skipped: no process lists them.
+  let systemParent: string | undefined;
+  // A preset whose own name is bundled is that system preset, written out in
+  // full or not; it needs no parent to be recognised.
+  const isBundledItself =
+    typeof profile.name === "string" &&
+    lookupProfile(index, category, profile.name.replace(/^# /, ""), "vendor") !== null;
 
   while (
     typeof current.inherits === "string" &&
@@ -136,6 +148,13 @@ export async function resolveProfile(
     if (found.scope === "vendor") {
       await applyCompanionTemplates(parent, parentName, category, options, templates);
     }
+    if (
+      systemParent === undefined &&
+      found.scope === "vendor" &&
+      parent.instantiation === "true"
+    ) {
+      systemParent = parentName;
+    }
 
     current = mergeProfiles(parent, current);
     scope = found.scope;
@@ -159,7 +178,81 @@ export async function resolveProfile(
     current.name = current.name.slice(2);
   }
 
+  if (options.keepSystemParent && !isBundledItself) {
+    keepSystemParent(current, systemParent);
+  }
+
   return current;
+}
+
+// The CLI does not check a process against the printer's name. It checks it
+// against the printer's *system* name: the preset's own name when `from` is
+// "system", its `inherits` otherwise (BambuStudio.cpp, the
+// CLI_PROCESS_NOT_COMPATIBLE check; OrcaSlicer's is the same code). A
+// flattened preset is marked "system", so a printer preset the user saved
+// under a name of their own -- "Bambu Lab H2D 0.4 nozzle - Skew" -- became its
+// own system name, which no process lists, and every slice with it failed
+// with "The selected printer is not compatible with the process preset"
+// (bambuddy#3250). The "# " strip above only covered the GUI's default name.
+//
+// Marking it as the user preset it is, with `inherits` naming the bundled
+// preset it was saved from, makes the CLI check that name instead. The
+// settings stay flattened: the CLI reads `inherits` only for this check and
+// never loads the parent, so the preset's own start G-code is what runs.
+function keepSystemParent(
+  profile: ProfileJson,
+  systemParent: string | undefined,
+): void {
+  if (!systemParent || profile.name === systemParent) {
+    return;
+  }
+  profile.inherits = systemParent;
+  profile.from = "User";
+}
+
+/**
+ * The two names a printer preset answers to: its own and, when
+ * keepSystemParent pointed it at one, the bundled preset it was saved from.
+ */
+export interface PrinterIdentity {
+  name: string;
+  systemName: string;
+}
+
+/** The identity of a materialised printer preset, or null when it is its own system preset. */
+export function printerIdentity(printer: ProfileJson): PrinterIdentity | null {
+  if (
+    printer.from === "User" &&
+    typeof printer.name === "string" &&
+    typeof printer.inherits === "string" &&
+    printer.inherits.length > 0 &&
+    printer.inherits !== printer.name
+  ) {
+    return { name: printer.name, systemName: printer.inherits };
+  }
+  return null;
+}
+
+// The GUI counts a process or filament as fitting a user printer when its
+// `compatible_printers` names either the printer or the preset it was saved
+// from (Preset.cpp, is_compatible_with_printer). The CLI checks only the one
+// system name. A list that names the user's printer itself -- one the user
+// pointed at it in the GUI -- would fail once keepSystemParent has made the
+// parent that system name, so the parent is added alongside (bambuddy#3250).
+export function acceptPrinterParent(
+  profile: ProfileJson,
+  printer: PrinterIdentity | null,
+): ProfileJson {
+  const list = profile.compatible_printers;
+  if (
+    printer &&
+    Array.isArray(list) &&
+    list.includes(printer.name) &&
+    !list.includes(printer.systemName)
+  ) {
+    profile.compatible_printers = [...list, printer.systemName];
+  }
+  return profile;
 }
 
 /**
@@ -307,10 +400,11 @@ export function ensureProfileType(
   return profile;
 }
 
-// The CLI's compatibility check accepts `from: "system"` (lowercase) as the
-// canonical system-tier marker and rejects everything else with
-// `from <value> unsupported` (return_code -5, surfaced as the same
-// "input preset file is invalid and can not be parsed." rejection).
+// The CLI accepts `from` as "system", "User" or "user" and rejects everything
+// else with `from <value> unsupported` (return_code -5, surfaced as the same
+// "input preset file is invalid and can not be parsed." rejection). "system"
+// also tells it the preset's own name is its system name, which is what a
+// flattened preset should claim -- unless keepSystemParent kept its parent.
 //
 // Two casings appear in real exports:
 //   - "User"   — user-cloned presets out of the OrcaSlicer/BambuStudio GUI.
@@ -326,6 +420,11 @@ export function ensureProfileType(
 // the CLI handles, and silently rewriting them would mask a real
 // mis-tagged file.
 export function normalizeFromField(profile: ProfileJson): ProfileJson {
+  // A profile that still names its parent is a user preset on purpose (see
+  // keepSystemParent); "User" is one of the values the CLI accepts.
+  if (typeof profile.inherits === "string" && profile.inherits.length > 0) {
+    return profile;
+  }
   if (profile.from === "User" || profile.from === "System") {
     profile.from = "system";
   }

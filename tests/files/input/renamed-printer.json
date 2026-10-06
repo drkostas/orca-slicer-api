@@ -1,0 +1,7 @@
+{
+  "type": "machine",
+  "name": "Bambu Lab X1 Carbon 0.4 nozzle - Skew Calibration",
+  "inherits": "Bambu Lab X1 Carbon 0.4 nozzle",
+  "from": "User",
+  "machine_start_gcode": "M1010.10 S0\nM1005 S1\n"
+}

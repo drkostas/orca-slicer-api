@@ -3,7 +3,9 @@ import { promises as fs } from "fs";
 import * as os from "os";
 import * as path from "path";
 import {
+  acceptPrinterParent,
   ensureProfileType,
+  printerIdentity,
   mergeProfiles,
   normalizeFromField,
   resolveProfile,
@@ -98,6 +100,7 @@ describe("resolveProfile", () => {
         type: "machine",
         name: "Bambu Lab X1 Carbon 0.4 nozzle",
         inherits: "fdm_bbl_3dp_001_common",
+        instantiation: "true",
         printer_model: "Bambu Lab X1 Carbon",
         nozzle_diameter: ["0.4"],
         printer_variant: "0.4",
@@ -202,6 +205,126 @@ describe("resolveProfile", () => {
       bundledProfilesPath,
     });
     expect(result.name).toBe("MyCustomConfig");
+  });
+
+  describe("keepSystemParent (bambuddy#3250)", () => {
+    // The CLI checks a process against the printer's system name: its own
+    // name when `from` is "system", its `inherits` otherwise. A renamed
+    // preset has to keep naming the bundled preset it was saved from.
+    const renamed: ProfileJson = {
+      type: "machine",
+      name: "Bambu Lab X1 Carbon 0.4 nozzle - Skew",
+      inherits: "Bambu Lab X1 Carbon 0.4 nozzle",
+      from: "User",
+      machine_start_gcode: ";MINE",
+    };
+
+    it("points a renamed preset at the bundled preset it was saved from", async () => {
+      const result = await resolveProfile({ ...renamed }, "machine", {
+        bundledProfilesPath,
+        keepSystemParent: true,
+      });
+      expect(result.inherits).toBe("Bambu Lab X1 Carbon 0.4 nozzle");
+      expect(result.from).toBe("User");
+      // Still flattened, and still the user's own settings and name.
+      expect(result.layer_change_gcode).toBe(";LAYER_CHANGE");
+      expect(result.printer_model).toBe("Bambu Lab X1 Carbon");
+      expect(result.machine_start_gcode).toBe(";MINE");
+      expect(result.name).toBe("Bambu Lab X1 Carbon 0.4 nozzle - Skew");
+    });
+
+    it("survives normalizeFromField, which the slicing path runs again", async () => {
+      const result = await resolveProfile({ ...renamed }, "machine", {
+        bundledProfilesPath,
+        keepSystemParent: true,
+      });
+      normalizeFromField(result);
+      expect(result.from).toBe("User");
+    });
+
+    it("leaves a preset named like its parent as a system preset", async () => {
+      const result = await resolveProfile(
+        {
+          type: "machine",
+          name: "Bambu Lab X1 Carbon 0.4 nozzle",
+          inherits: "Bambu Lab X1 Carbon 0.4 nozzle",
+          from: "system",
+        },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
+
+    it("leaves a '# ' clone of its parent as a system preset", async () => {
+      const result = await resolveProfile(
+        {
+          type: "machine",
+          name: "# Bambu Lab X1 Carbon 0.4 nozzle",
+          inherits: "Bambu Lab X1 Carbon 0.4 nozzle",
+          from: "User",
+        },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
+
+    it("leaves a bundled preset written out in full alone", async () => {
+      // Its own `inherits` names a template, which no process lists. Taking
+      // that as the system name broke every slice with a full profile.
+      const result = await resolveProfile(
+        {
+          type: "machine",
+          name: "Bambu Lab X1 Carbon 0.4 nozzle",
+          inherits: "fdm_bbl_3dp_001_common",
+          from: "system",
+        },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
+
+    it("never names a template as the parent", async () => {
+      const result = await resolveProfile(
+        { type: "machine", name: "Mine", inherits: "fdm_bbl_3dp_001_common", from: "User" },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
+
+    it("names the selectable preset, not the template it inherits from", async () => {
+      const result = await resolveProfile(
+        { type: "machine", name: "Mine", inherits: "Bambu Lab X1 Carbon 0.4 nozzle", from: "User" },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBe("Bambu Lab X1 Carbon 0.4 nozzle");
+    });
+
+    it("changes nothing when the parent is not bundled", async () => {
+      const result = await resolveProfile(
+        { type: "machine", name: "Mine", inherits: "Someone else's preset", from: "User" },
+        "machine",
+        { bundledProfilesPath, keepSystemParent: true },
+      );
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
+
+    it("is off unless asked for, so /profiles/resolve output is unchanged", async () => {
+      const result = await resolveProfile({ ...renamed }, "machine", {
+        bundledProfilesPath,
+      });
+      expect(result.inherits).toBeUndefined();
+      expect(result.from).toBe("system");
+    });
   });
 
   it("strips '-1' and empty-string sentinel values from user deltas", async () => {
@@ -374,6 +497,13 @@ describe("normalizeFromField", () => {
     const profile: ProfileJson = { name: "x" };
     normalizeFromField(profile);
     expect(profile.from).toBeUndefined();
+  });
+
+  it("leaves a profile that still names its parent as it is", () => {
+    // keepSystemParent's output: a user preset on purpose (bambuddy#3250).
+    const profile: ProfileJson = { name: "x", inherits: "y", from: "User" };
+    normalizeFromField(profile);
+    expect(profile.from).toBe("User");
   });
 
   it("mutates in place and returns the same reference", () => {
@@ -618,5 +748,52 @@ describe("resolveProfile with companion templates", () => {
 
     expect(result.name).toBe("p");
     expect(result.inherits).toBeUndefined();
+  });
+});
+
+describe("printerIdentity / acceptPrinterParent (bambuddy#3250)", () => {
+  const renamed: ProfileJson = {
+    name: "Bambu Lab H2D 0.4 nozzle - Skew",
+    inherits: "Bambu Lab H2D 0.4 nozzle",
+    from: "User",
+  };
+  const identity = { name: "Bambu Lab H2D 0.4 nozzle - Skew", systemName: "Bambu Lab H2D 0.4 nozzle" };
+
+  it("reads the two names of a printer keepSystemParent pointed at its parent", () => {
+    expect(printerIdentity(renamed)).toEqual(identity);
+  });
+
+  it("has nothing to say about a printer that is its own system preset", () => {
+    expect(printerIdentity({ name: "Bambu Lab H2D 0.4 nozzle", from: "system" })).toBeNull();
+    expect(printerIdentity({ name: "x", from: "User" })).toBeNull();
+  });
+
+  it("adds the parent to a list that names the printer itself", () => {
+    // The GUI accepts either name; the CLI checks only the parent.
+    const process: ProfileJson = { compatible_printers: [identity.name] };
+    acceptPrinterParent(process, identity);
+    expect(process.compatible_printers).toEqual([identity.name, identity.systemName]);
+  });
+
+  it("leaves a list that already names the parent alone", () => {
+    const list = [identity.systemName, "Bambu Lab X1 Carbon 0.4 nozzle"];
+    const process: ProfileJson = { compatible_printers: [...list] };
+    acceptPrinterParent(process, identity);
+    expect(process.compatible_printers).toEqual(list);
+  });
+
+  it("never makes a list for another printer fit", () => {
+    const process: ProfileJson = { compatible_printers: ["Bambu Lab X1 Carbon 0.4 nozzle"] };
+    acceptPrinterParent(process, identity);
+    expect(process.compatible_printers).toEqual(["Bambu Lab X1 Carbon 0.4 nozzle"]);
+  });
+
+  it("leaves missing lists and stock printers alone", () => {
+    const none: ProfileJson = {};
+    acceptPrinterParent(none, identity);
+    expect(none.compatible_printers).toBeUndefined();
+    const process: ProfileJson = { compatible_printers: [identity.name] };
+    acceptPrinterParent(process, null);
+    expect(process.compatible_printers).toEqual([identity.name]);
   });
 });

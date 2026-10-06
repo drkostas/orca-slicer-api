@@ -50,6 +50,51 @@ describe("STL Slicing - delta profile resolution", () => {
     expect(filamentUsedMm).toBeGreaterThan(0);
   });
 
+  it("slices with a printer preset saved under a name of its own (bambuddy#3250)", async () => {
+    // The CLI checks the process against the printer's system name. A
+    // flattened preset claimed its own name as that, which no process lists.
+    const fileBuffer = fs.readFileSync(path.join(__dirname, "../files/input/Cube.stl"));
+    const printerBuffer = fs.readFileSync(
+      path.join(__dirname, "../files/input/renamed-printer.json"),
+    );
+    const presetBuffer = fs.readFileSync(
+      path.join(__dirname, "../files/input/delta-process.json"),
+    );
+    const filamentBuffer = fs.readFileSync(path.join(__dirname, "../files/input/filament.json"));
+
+    const response = await request
+      .post("/slice")
+      .attach("file", fileBuffer, "Cube.stl")
+      .attach("printerProfile", printerBuffer, "printer.json")
+      .attach("presetProfile", presetBuffer, "process.json")
+      .attach("filamentProfile", filamentBuffer, "filament.json")
+      .expect(200);
+
+    expect(Number(response.headers["x-print-time-seconds"])).toBeGreaterThan(0);
+  });
+
+  it("slices with a process that lists only the renamed printer (bambuddy#3250)", async () => {
+    // The GUI accepts a process naming the user's printer or its parent;
+    // the CLI checks only the parent once the printer points at it.
+    const response = await request
+      .post("/slice")
+      .attach("file", fs.readFileSync(path.join(__dirname, "../files/input/Cube.stl")), "Cube.stl")
+      .attach(
+        "printerProfile",
+        fs.readFileSync(path.join(__dirname, "../files/input/renamed-printer.json")),
+        "printer.json",
+      )
+      .attach(
+        "presetProfile",
+        fs.readFileSync(path.join(__dirname, "../files/input/renamed-printer-process.json")),
+        "process.json",
+      )
+      .attach("filamentProfile", fs.readFileSync(path.join(__dirname, "../files/input/filament.json")), "filament.json")
+      .expect(200);
+
+    expect(Number(response.headers["x-print-time-seconds"])).toBeGreaterThan(0);
+  });
+
   it("returns 400 when an uploaded profile is not valid JSON", async () => {
     const filePath = path.join(__dirname, "../files/input/Cube.stl");
     const fileBuffer = fs.readFileSync(filePath);
